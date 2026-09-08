@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>WarpScout Chain</title>
+  <title>WarpScout Chain - 全自动双层版</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body { background: #0b0f19; color: #e2e8f0; padding: 18px; user-select: none; }
@@ -25,19 +25,20 @@
     .btn-copy-log { background: #1e293b; border: 1px solid #374151; color: #38bdf8; padding: 3px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; transition: all 0.2s; }
     .btn-copy-log:hover { background: #334155; color: #fff; }
 
-    .log-box { background: #030712; border: 1px solid #1f2937; border-radius: 6px; padding: 10px; height: 125px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #34d399; white-space: pre-wrap; word-break: break-all; }
+    .log-box { background: #030712; border: 1px solid #1f2937; border-radius: 6px; padding: 10px; height: 135px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #34d399; white-space: pre-wrap; word-break: break-all; }
     
     .output-box { margin-top: 12px; display: none; }
     .export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
     .btn-export { background: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 9px 8px; border-radius: 6px; font-size: 12px; cursor: pointer; text-align: center; }
     .btn-export:hover { background: #334155; color: #38bdf8; }
     .sub-input { width: 100%; background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; color: #38bdf8; font-family: monospace; font-size: 12px; margin-top: 4px; }
+    .notice-box { margin-top: 10px; font-size: 12px; color: #fbbf24; font-weight: bold; background: rgba(245, 158, 11, 0.1); padding: 8px; border-radius: 4px; border: 1px solid rgba(245, 158, 11, 0.2); }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="title">WarpScout Chain</div>
-    <span class="badge">多节点自动故障转移</span>
+    <span class="badge">全自动双层刷取解锁</span>
   </div>
 
   <div class="section">
@@ -47,17 +48,20 @@
       <label><input type="radio" name="proto" value="h2"> MASQUE (H2)</label>
       <label><input type="radio" name="proto" value="h3"> MASQUE (H3)</label>
     </div>
+    <div class="notice-box">
+      ⚡ 程序将在后台无感调用 <code>sing-box</code> 开启代理并刷取二层纯净解锁节点。请务必确认 <code>sing-box.exe</code> 与本程序放置在同一文件夹中。
+    </div>
   </div>
 
   <div class="section">
     <label>[2] 优选节点生成数量 (Endpoint Count)</label>
     <div style="display: flex; align-items: center; gap: 8px;">
       <input type="number" id="epCount" class="input-box" value="10" min="1" max="30">
-      <span style="font-size: 12px; color: #94a3b8;">个（自动生成多节点聚合与测速排序组）</span>
+      <span style="font-size: 12px; color: #94a3b8;">个（最终 B 配置输出的节点数）</span>
     </div>
   </div>
 
-  <button class="btn-main" id="btnStart" onclick="startRun()">🚀 开始真实测速与多节点组装</button>
+  <button class="btn-main" id="btnStart" onclick="startRun()">🚀 一键全自动（筛端点 ➜ 启代理 ➜ 刷内层 ➜ 出配置）</button>
 
   <div class="scan-dashboard" id="scanDashboard">
     <div class="scan-info-row">
@@ -81,11 +85,11 @@
     <label>Sing-box 本地订阅链接:</label>
     <input type="text" id="subUrl" class="sub-input" readonly value="http://127.0.0.1:8888/sub">
 
-    <label style="margin-top: 10px;">点击直接下载包含多节点与测速排序的配置：</label>
+    <label style="margin-top: 10px;">以下为您生成的二次定型客户端配置（B 配置）：</label>
     <div class="export-grid">
-      <button class="btn-export" onclick="downloadFile('warp-singbox-multi.json', jsonData)">⚡ 导出 Sing-box (多节点JSON)</button>
-      <button class="btn-export" onclick="downloadFile('warp-clash-multi.yaml', yamlData)">⚡ 导出 Clash-Meta (多节点YAML)</button>
-      <button class="btn-export" style="grid-column: span 2;" onclick="window.location.href='http://127.0.0.1:8888/download-zip'">📦 下载 WireGuard 10节点配置 (.zip)</button>
+      <button class="btn-export" onclick="downloadFile('warp-singbox-multi.json', jsonData)">⚡ 导出 Sing-box</button>
+      <button class="btn-export" onclick="downloadFile('warp-clash-multi.yaml', yamlData)">⚡ 导出 Clash-Meta</button>
+      <button class="btn-export" style="grid-column: span 2;" onclick="window.location.href='http://127.0.0.1:8888/download-zip'">📦 下载 WireGuard 纯净独立节点 (.zip)</button>
     </div>
   </div>
 
@@ -159,7 +163,7 @@
       document.getElementById('btnStart').disabled = true;
       document.getElementById('outputBox').style.display = 'none';
       document.getElementById('scanDashboard').style.display = 'block';
-      document.getElementById('logWindow').innerText = "[任务启动] 开始端点网络测速与 API 凭证注册...";
+      document.getElementById('logWindow').innerText = "[任务启动] 进入自动化双层流水线...";
 
       try {
         const proto = document.querySelector('input[name="proto"]:checked').value;
@@ -171,7 +175,7 @@
         document.getElementById('subUrl').value = res.subUrl;
         document.getElementById('outputBox').style.display = 'block';
       } catch (err) {
-        appendLog("[错误] " + err);
+        appendLog("[致命错误] " + err);
       } finally {
         document.getElementById('btnStart').disabled = false;
       }
