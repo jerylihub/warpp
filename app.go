@@ -14,6 +14,9 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -88,20 +91,13 @@ func (a *App) startLocalServer() {
 }
 
 var cfIPv4Prefixes = []string{
-	"162.159.192",
-	"162.159.193",
-	"162.159.195",
-	"188.114.96",
-	"188.114.97",
-	"188.114.98",
-	"188.114.99",
+	"162.159.192", "162.159.193", "162.159.195",
+	"188.114.96", "188.114.97", "188.114.98", "188.114.99",
 }
 
 var cfIPv6OfficialEndpoints = []string{
-	"[2606:4700:d0::a29f:c001]",
-	"[2606:4700:d0::a29f:c101]",
-	"[2606:4700:d1::a29f:c201]",
-	"[2606:4700:d1::a29f:c301]",
+	"[2606:4700:d0::a29f:c001]", "[2606:4700:d0::a29f:c101]",
+	"[2606:4700:d1::a29f:c201]", "[2606:4700:d1::a29f:c301]",
 }
 
 var all54OfficialPorts = []int{
@@ -171,7 +167,8 @@ func generateWireguardKeyPair() (string, string, error) {
 	return base64.StdEncoding.EncodeToString(priv[:]), base64.StdEncoding.EncodeToString(pub[:]), nil
 }
 
-func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
+// 核心修改 1：支持传入 proxyUrl 走底层隧道代理注册
+func (a *App) RegisterCloudflareAccount(tag string, proxyUrl string) (*WarpAccount, error) {
 	a.sendLog(fmt.Sprintf("向官方 API 申请真实 WARP 身份凭证 [%s]...", tag))
 	priv, pub, err := generateWireguardKeyPair()
 	if err != nil {
@@ -193,7 +190,17 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 		TLSClientConfig: &tls.Config{
 			ServerName: "api.cloudflareclient.com",
 		},
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+	}
+
+	// 如果传入了代理地址，则配置 HTTP 客户端走代理，同时自动解决 DNS 污染
+	if proxyUrl != "" {
+		pUrl, err := url.Parse(proxyUrl)
+		if err == nil {
+			transport.Proxy = http.ProxyURL(pUrl)
+		}
+	} else {
+		// 直连模式，强行劫持 IP
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if strings.HasPrefix(addr, "api.cloudflareclient.com:") {
 				for _, ip := range []string{"162.159.192.1", "162.159.193.1", "188.114.96.1"} {
 					conn, err := dialer.DialContext(ctx, network, ip+":443")
@@ -203,9 +210,10 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 				}
 			}
 			return dialer.DialContext(ctx, network, addr)
-		},
+		}
 	}
-	client := &http.Client{Transport: transport, Timeout: 12 * time.Second}
+
+	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
 
 	req, err := http.NewRequest("POST", "https://api.cloudflareclient.com/v0a3371/reg", bytes.NewBuffer(reqBody))
 	if err != nil {
@@ -216,7 +224,7 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("直连 Cloudflare 注册 API 失败: %w", err)
+		return nil, fmt.Errorf("API 请求失败 (代理状态: %v): %w", proxyUrl != "", err)
 	}
 	defer resp.Body.Close()
 
@@ -266,7 +274,6 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 	}, nil
 }
 
-// 严格双轮三次连续验证：3 次必须全响应 cf00000000，否则直接淘汰（保证 0 丢包）
 func probeEndpointStrict(addrStr string, timeout time.Duration) (int64, float64, bool) {
 	addr, err := net.ResolveUDPAddr("udp", addrStr)
 	if err != nil {
@@ -294,7 +301,7 @@ func probeEndpointStrict(addrStr string, timeout time.Duration) (int64, float64,
 		buf := make([]byte, 256)
 		n, err := conn.Read(buf)
 		if err != nil || n < 5 || buf[0] != 0xcf || buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0x00 || buf[4] != 0x00 {
-			return 0, 0, false // 只要有 1 次没收到标准回包，立即淘汰
+			return 0, 0, false 
 		}
 
 		rtt := time.Since(start).Milliseconds()
@@ -314,7 +321,6 @@ func probeEndpointStrict(addrStr string, timeout time.Duration) (int64, float64,
 	avgRtt := totalRtt / int64(testRuns)
 	jitter := maxRtt - minRtt
 
-	// 计算真实可信的有效吞吐（Mbps）：延迟越低、抖动越小，下载速度评分越高
 	speed := (1000.0 / float64(avgRtt)) * 14.8 - float64(jitter)*0.35
 	if speed < 15.0 {
 		speed = 18.0 + float64(time.Now().UnixNano()%10)
@@ -376,7 +382,6 @@ func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 			defer wg.Done()
 			for t := range taskChan {
 				addrStr := fmt.Sprintf("%s:%d", t.IP, t.Port)
-
 				rtt, speed, ok := probeEndpointStrict(addrStr, 800*time.Millisecond)
 				curr := atomic.AddInt64(&completed, 1)
 
@@ -410,7 +415,6 @@ func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 		validList = append(validList, r)
 	}
 
-	// 严格按下载速度从高到低排序，速度快的在前排编号
 	sort.Slice(validList, func(i, j int) bool {
 		if validList[i].SpeedMbps == validList[j].SpeedMbps {
 			return validList[i].Latency < validList[j].Latency
@@ -418,28 +422,82 @@ func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 		return validList[i].SpeedMbps > validList[j].SpeedMbps
 	})
 
-	a.sendLog(fmt.Sprintf("✔ 探测完成！经严格 3 轮校验，真实 0 丢包的高质量活端点: %d 个", len(validList)))
+	a.sendLog(fmt.Sprintf("✔ 探测完成！真实 0 丢包高质量活端点: %d 个", len(validList)))
 
 	if len(validList) == 0 {
-		return nil, errors.New("未能探测到 0 丢包的可用节点，请检查当前网络 UDP 连接")
+		return nil, errors.New("未能探测到 0 丢包的可用节点，请检查当前网络")
 	}
 
 	if len(validList) > maxCount {
 		validList = validList[:maxCount]
 	}
 
-	// 日志末尾输出 10 个节点的完整参数明细
-	a.sendLog("==================== 🏆 Top 优选节点详细列表 ====================")
-	for idx, node := range validList {
-		a.sendLog(fmt.Sprintf("节点 %02d | IP+端口: %s:%d | 下载速度: %.1f Mbps | 延迟: %d ms | 丢包率: 0.0%%",
-			idx+1, strings.Trim(node.IP, "[]"), node.Port, node.SpeedMbps, node.Latency))
-	}
-	a.sendLog("================================================================")
-
 	return validList, nil
 }
 
-// 解决参数签名报错：接收 protocol (string) 和 count (int) 两个参数
+// 核心修改 2：在后台静默启动 sing-box 作为临时代理 (即你的 A 配置开启代理过程)
+func (a *App) startSingBoxProxy(acc *WarpAccount, ep EndpointResult, proto string, port int) (*exec.Cmd, error) {
+	cleanIP := strings.Trim(ep.IP, "[]")
+	cleanV4 := strings.TrimSuffix(acc.AddressV4, "/32")
+	cleanV6 := strings.TrimSuffix(acc.AddressV6, "/128")
+
+	outbound := map[string]interface{}{
+		"type":            "wireguard",
+		"tag":             "warp-out",
+		"server":          cleanIP,
+		"server_port":     ep.Port,
+		"local_address":   []string{cleanV4 + "/32", cleanV6 + "/128"},
+		"private_key":     acc.PrivateKey,
+		"peer_public_key": acc.PeerPublicKey,
+		"reserved":        []int{int(acc.Reserved[0]), int(acc.Reserved[1]), int(acc.Reserved[2])},
+		"mtu":             1280,
+	}
+
+	if proto == "awg" {
+		outbound["amneziawg"] = map[string]interface{}{
+			"jc": 4, "jmin": 40, "jmax": 70, "s1": 0, "s2": 0, "h1": 1, "h2": 2, "h3": 3, "h4": 4,
+		}
+	}
+
+	config := map[string]interface{}{
+		"log": map[string]interface{}{"level": "error"},
+		"inbounds": []map[string]interface{}{
+			{
+				"type":        "socks",
+				"tag":         "socks-in",
+				"listen":      "127.0.0.1",
+				"listen_port": port,
+			},
+		},
+		"outbounds": []interface{}{outbound},
+	}
+
+	cfgBytes, _ := json.MarshalIndent(config, "", "  ")
+	err := os.WriteFile("temp_proxy.json", cfgBytes, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("写入临时代理配置失败: %w", err)
+	}
+
+	binName := "sing-box"
+	if _, err := exec.LookPath(binName); err != nil {
+		if _, err := os.Stat("sing-box.exe"); err == nil {
+			binName = "./sing-box.exe"
+		} else if _, err := os.Stat("./sing-box"); err == nil {
+			binName = "./sing-box"
+		} else {
+			return nil, errors.New("找不到 sing-box 核心，请将其放入同目录以完成自动内层解锁")
+		}
+	}
+
+	cmd := exec.Command(binName, "run", "-c", "temp_proxy.json")
+	err = cmd.Start()
+	if err != nil {
+		return nil, fmt.Errorf("后台启动临时代理失败: %w", err)
+	}
+
+	return cmd, nil
+}
+
 func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, error) {
 	if count <= 0 {
 		count = 10
@@ -449,23 +507,45 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		proto = "awg"
 	}
 
-	// 1. 注册外层主账号
-	outerAcc, err := a.RegisterCloudflareAccount("外层优选节点")
+	// ==================== 第一步：底层探测（筛选可用端点） ====================
+	endpoints, err := a.RunWarpScoutFullEngine(count)
+	if err != nil {
+		a.sendLog(fmt.Sprintf("❌ 测速失败: %v", err))
+		return nil, err
+	}
+
+	// ==================== 第二步：直连注册外层主账号 ====================
+	outerAcc, err := a.RegisterCloudflareAccount("外层优选节点", "")
 	if err != nil {
 		a.sendLog(fmt.Sprintf("❌ 外层注册失败: %v", err))
 		return nil, err
 	}
 
-	// 2. 注册内层独立账号（用于 sing-box 双层 WARP-on-WARP 解锁 AI）
-	innerAcc, err := a.RegisterCloudflareAccount("内层AI出口")
+	// ==================== 第三步：后台全自动建立临时代理 (A 配置启动) ====================
+	a.sendLog("正在全自动唤起后台临时代理 (利用首个端点组装 A配置)...")
+	cmd, err := a.startSingBoxProxy(outerAcc, endpoints[0], proto, 20808)
 	if err != nil {
-		a.sendLog(fmt.Sprintf("❌ 内层注册失败: %v", err))
+		a.sendLog(fmt.Sprintf("❌ 自动开启代理失败: %v", err))
 		return nil, err
 	}
+	
+	// 确保方法退出时自动清理进程和临时文件
+	defer func() {
+		if cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		os.Remove("temp_proxy.json")
+		a.sendLog("临时代理进程已自动关闭并清理干净。")
+	}()
 
-	endpoints, err := a.RunWarpScoutFullEngine(count)
+	a.sendLog("等待隧道底层连接握手 (约 4 秒)...")
+	time.Sleep(4 * time.Second)
+
+	// ==================== 第四步：走代理进行第二层筛选 (注册内层纯净 AI 账号) ====================
+	a.sendLog("底层代理就绪！正在通过代理向 CF 获取内层原生 AI 解锁节点...")
+	innerAcc, err := a.RegisterCloudflareAccount("内层AI出口", "socks5://127.0.0.1:20808")
 	if err != nil {
-		a.sendLog(fmt.Sprintf("❌ 测速失败: %v", err))
+		a.sendLog(fmt.Sprintf("❌ 内层注册失败 (代理可能未连通): %v", err))
 		return nil, err
 	}
 
@@ -476,7 +556,9 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 	cleanInnerV4 := strings.TrimSuffix(innerAcc.AddressV4, "/32")
 	cleanInnerV6 := strings.TrimSuffix(innerAcc.AddressV6, "/128")
 
-	// ==================== 1. Sing-box 双层 WARP-on-WARP 极致 AI 解锁配置 ====================
+	// ==================== 第五步：组装并输出最终定型的 B 配置 ====================
+	a.sendLog("账号全取回完毕！正在组装二次定型的最终配置 (B 配置)...")
+
 	var singboxOutbounds []interface{}
 	var outerTags []string
 
@@ -497,25 +579,15 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 			"mtu":             1280,
 		}
 
-		// 协议适配：若为 awg，则写入官方 Amnezia 扩展字段
 		if proto == "awg" {
 			node["amneziawg"] = map[string]interface{}{
-				"jc":   4,
-				"jmin": 40,
-				"jmax": 70,
-				"s1":   0,
-				"s2":   0,
-				"h1":   1,
-				"h2":   2,
-				"h3":   3,
-				"h4":   4,
+				"jc": 4, "jmin": 40, "jmax": 70, "s1": 0, "s2": 0, "h1": 1, "h2": 2, "h3": 3, "h4": 4,
 			}
 		}
 
 		singboxOutbounds = append(singboxOutbounds, node)
 	}
 
-	// 外层自动测速容灾组
 	outerUrlTest := map[string]interface{}{
 		"type":      "urltest",
 		"tag":       "WARP-外层优选",
@@ -524,7 +596,6 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"interval":  "3m",
 	}
 
-	// 内层 WARP-on-WARP 节点：通过外层最优直连通道转发，出口获得纯净 AI 解锁
 	innerNode := map[string]interface{}{
 		"type":            "wireguard",
 		"tag":             "🤖 AI-WARP专线",
@@ -534,7 +605,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"private_key":     innerAcc.PrivateKey,
 		"peer_public_key": innerAcc.PeerPublicKey,
 		"reserved":        []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
-		"mtu":             1200, // 内层 MTU 必须严格小于外层以防分片死锁
+		"mtu":             1200, 
 		"detour":          "WARP-外层优选",
 	}
 
@@ -555,7 +626,6 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		map[string]interface{}{"type": "dns", "tag": "dns-out"},
 	)
 
-	// 核心修复：DNS 改为直连隧道内 1.1.1.1 UDP 53，杜绝死锁与超慢延迟
 	singboxConfig := map[string]interface{}{
 		"$schema": "https://sing-box.sagernet.org/schema.json",
 		"dns": map[string]interface{}{
@@ -586,7 +656,6 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 	}
 	singboxJSON, _ := json.MarshalIndent(singboxConfig, "", "  ")
 
-	// ==================== 2. Clash-Meta (Mihomo) 多节点配置 (核心修复：Fake-IP + 远程 DNS + AWG 混淆) ====================
 	var clashProxies strings.Builder
 	var clashNodeNames []string
 
@@ -616,7 +685,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 
 `, nodeName, cleanIP, alpnVal, outerAcc.AccountID))
 
-		default: // "awg" 默认混淆模式
+		default: 
 			clashProxies.WriteString(fmt.Sprintf(`  - name: "%s"
     type: wireguard
     server: %s
@@ -647,7 +716,6 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		}
 	}
 
-	// 注入 Fake-IP 模式，阻止本地阿里 DNS 污染谷歌/AI 域名
 	clashYaml := fmt.Sprintf(`port: 7890
 socks-port: 7891
 allow-lan: false
@@ -709,7 +777,6 @@ rules:
   - MATCH,WARP 自动优选
 `, clashProxies.String(), strings.Join(clashNodeNames, "\n"), strings.Join(clashNodeNames, "\n"))
 
-	// ==================== 3. 生成 10 个独立 WireGuard/AWG 配置并打包为 ZIP ====================
 	buf := new(bytes.Buffer)
 	zipWriter := zip.NewWriter(buf)
 
@@ -758,7 +825,7 @@ rules:
 	a.subContent = string(singboxJSON)
 	a.subMutex.Unlock()
 
-	a.sendLog(fmt.Sprintf("✔ 成功生成 %d 个极速 0 丢包节点，已按下载速度降序编排！", len(endpoints)))
+	a.sendLog(fmt.Sprintf("✔ 全自动二层刷取完成！成功生成 %d 个极速 0 丢包节点！", len(endpoints)))
 
 	return map[string]string{
 		"singbox":   string(singboxJSON),
