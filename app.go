@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	_ "embed" // 引入 embed 包
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -27,11 +29,15 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
+//go:embed sing-box.exe
+var singboxBin []byte
+
 type App struct {
-	ctx        context.Context
-	subContent string
-	subMutex   sync.RWMutex
-	zipContent []byte
+	ctx             context.Context
+	subContent      string
+	subMutex        sync.RWMutex
+	zipContent      []byte
+	tempSingboxPath string // 记录释放到系统临时目录的 sing-box 路径
 }
 
 func NewApp() *App {
@@ -41,6 +47,16 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	go a.startLocalServer()
+
+	// 初始化时：将内置的 sing-box.exe 释放到系统临时目录
+	tempDir := os.TempDir()
+	a.tempSingboxPath = filepath.Join(tempDir, "warp-scout-singbox.exe")
+	err := os.WriteFile(a.tempSingboxPath, singboxBin, 0755)
+	if err != nil {
+		a.sendLog("警告: 释放内置 sing-box 核心失败，可能导致代理启动异常: " + err.Error())
+	} else {
+		a.sendLog("✔ 内置 sing-box 核心已就绪，已实现单文件闭环。")
+	}
 }
 
 func (a *App) sendLog(msg string) {
@@ -167,7 +183,6 @@ func generateWireguardKeyPair() (string, string, error) {
 	return base64.StdEncoding.EncodeToString(priv[:]), base64.StdEncoding.EncodeToString(pub[:]), nil
 }
 
-// 核心修改 1：支持传入 proxyUrl 走底层隧道代理注册
 func (a *App) RegisterCloudflareAccount(tag string, proxyUrl string) (*WarpAccount, error) {
 	a.sendLog(fmt.Sprintf("向官方 API 申请真实 WARP 身份凭证 [%s]...", tag))
 	priv, pub, err := generateWireguardKeyPair()
@@ -192,14 +207,12 @@ func (a *App) RegisterCloudflareAccount(tag string, proxyUrl string) (*WarpAccou
 		},
 	}
 
-	// 如果传入了代理地址，则配置 HTTP 客户端走代理，同时自动解决 DNS 污染
 	if proxyUrl != "" {
 		pUrl, err := url.Parse(proxyUrl)
 		if err == nil {
 			transport.Proxy = http.ProxyURL(pUrl)
 		}
 	} else {
-		// 直连模式，强行劫持 IP
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if strings.HasPrefix(addr, "api.cloudflareclient.com:") {
 				for _, ip := range []string{"162.159.192.1", "162.159.193.1", "188.114.96.1"} {
@@ -301,7 +314,7 @@ func probeEndpointStrict(addrStr string, timeout time.Duration) (int64, float64,
 		buf := make([]byte, 256)
 		n, err := conn.Read(buf)
 		if err != nil || n < 5 || buf[0] != 0xcf || buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0x00 || buf[4] != 0x00 {
-			return 0, 0, false 
+			return 0, 0, false
 		}
 
 		rtt := time.Since(start).Milliseconds()
@@ -435,7 +448,7 @@ func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 	return validList, nil
 }
 
-// 核心修改 2：在后台静默启动 sing-box 作为临时代理 (即你的 A 配置开启代理过程)
+// 核心修改：直接调用被释放的内置 sing-box，丢弃原有的路径查找逻辑
 func (a *App) startSingBoxProxy(acc *WarpAccount, ep EndpointResult, proto string, port int) (*exec.Cmd, error) {
 	cleanIP := strings.Trim(ep.IP, "[]")
 	cleanV4 := strings.TrimSuffix(acc.AddressV4, "/32")
@@ -478,21 +491,15 @@ func (a *App) startSingBoxProxy(acc *WarpAccount, ep EndpointResult, proto strin
 		return nil, fmt.Errorf("写入临时代理配置失败: %w", err)
 	}
 
-	binName := "sing-box"
-	if _, err := exec.LookPath(binName); err != nil {
-		if _, err := os.Stat("sing-box.exe"); err == nil {
-			binName = "./sing-box.exe"
-		} else if _, err := os.Stat("./sing-box"); err == nil {
-			binName = "./sing-box"
-		} else {
-			return nil, errors.New("找不到 sing-box 核心，请将其放入同目录以完成自动内层解锁")
-		}
+	if _, err := os.Stat(a.tempSingboxPath); os.IsNotExist(err) {
+		return nil, errors.New("致命错误: 找不到系统内置的 sing-box 核心环境，请尝试以管理员身份运行")
 	}
 
-	cmd := exec.Command(binName, "run", "-c", "temp_proxy.json")
+	// 强制调用我们在 startup 阶段释放的内置单文件
+	cmd := exec.Command(a.tempSingboxPath, "run", "-c", "temp_proxy.json")
 	err = cmd.Start()
 	if err != nil {
-		return nil, fmt.Errorf("后台启动临时代理失败: %w", err)
+		return nil, fmt.Errorf("后台启动内置代理核心失败: %w", err)
 	}
 
 	return cmd, nil
@@ -507,29 +514,25 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		proto = "awg"
 	}
 
-	// ==================== 第一步：底层探测（筛选可用端点） ====================
 	endpoints, err := a.RunWarpScoutFullEngine(count)
 	if err != nil {
 		a.sendLog(fmt.Sprintf("❌ 测速失败: %v", err))
 		return nil, err
 	}
 
-	// ==================== 第二步：直连注册外层主账号 ====================
 	outerAcc, err := a.RegisterCloudflareAccount("外层优选节点", "")
 	if err != nil {
 		a.sendLog(fmt.Sprintf("❌ 外层注册失败: %v", err))
 		return nil, err
 	}
 
-	// ==================== 第三步：后台全自动建立临时代理 (A 配置启动) ====================
-	a.sendLog("正在全自动唤起后台临时代理 (利用首个端点组装 A配置)...")
+	a.sendLog("正在全自动唤起内置代理核心 (调用 singboxBin)...")
 	cmd, err := a.startSingBoxProxy(outerAcc, endpoints[0], proto, 20808)
 	if err != nil {
 		a.sendLog(fmt.Sprintf("❌ 自动开启代理失败: %v", err))
 		return nil, err
 	}
 	
-	// 确保方法退出时自动清理进程和临时文件
 	defer func() {
 		if cmd != nil && cmd.Process != nil {
 			cmd.Process.Kill()
@@ -541,7 +544,6 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 	a.sendLog("等待隧道底层连接握手 (约 4 秒)...")
 	time.Sleep(4 * time.Second)
 
-	// ==================== 第四步：走代理进行第二层筛选 (注册内层纯净 AI 账号) ====================
 	a.sendLog("底层代理就绪！正在通过代理向 CF 获取内层原生 AI 解锁节点...")
 	innerAcc, err := a.RegisterCloudflareAccount("内层AI出口", "socks5://127.0.0.1:20808")
 	if err != nil {
@@ -552,11 +554,9 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 	reservedOuterStr := fmt.Sprintf("[%d, %d, %d]", outerAcc.Reserved[0], outerAcc.Reserved[1], outerAcc.Reserved[2])
 	cleanOuterV4 := strings.TrimSuffix(outerAcc.AddressV4, "/32")
 	cleanOuterV6 := strings.TrimSuffix(outerAcc.AddressV6, "/128")
-
 	cleanInnerV4 := strings.TrimSuffix(innerAcc.AddressV4, "/32")
 	cleanInnerV6 := strings.TrimSuffix(innerAcc.AddressV6, "/128")
 
-	// ==================== 第五步：组装并输出最终定型的 B 配置 ====================
 	a.sendLog("账号全取回完毕！正在组装二次定型的最终配置 (B 配置)...")
 
 	var singboxOutbounds []interface{}
