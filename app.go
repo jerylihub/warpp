@@ -37,7 +37,7 @@ type App struct {
 	subContent      string
 	subMutex        sync.RWMutex
 	zipContent      []byte
-	tempSingboxPath string // 记录释放到系统临时目录的 sing-box 路径
+	tempSingboxPath string // 记录 sing-box 核心的可执行文件路径
 }
 
 func NewApp() *App {
@@ -48,15 +48,54 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	go a.startLocalServer()
 
-	// 初始化时：将内置的 sing-box.exe 释放到系统临时目录
-	tempDir := os.TempDir()
-	a.tempSingboxPath = filepath.Join(tempDir, "warp-scout-singbox.exe")
-	err := os.WriteFile(a.tempSingboxPath, singboxBin, 0755)
-	if err != nil {
-		a.sendLog("警告: 释放内置 sing-box 核心失败，可能导致代理启动异常: " + err.Error())
-	} else {
-		a.sendLog("✔ 内置 sing-box 核心已就绪，已实现单文件闭环。")
+	// 初始化时准备 sing-box 核心路径
+	a.tempSingboxPath = a.prepareSingbox()
+}
+
+// prepareSingbox 智能解析与准备 sing-box 可执行核心
+func (a *App) prepareSingbox() string {
+	// 1. 若嵌入了有效的二进制文件，优先释放到临时目录
+	if len(singboxBin) > 0 {
+		tempDir := os.TempDir()
+		targetPath := filepath.Join(tempDir, "warp-scout-singbox.exe")
+		err := os.WriteFile(targetPath, singboxBin, 0755)
+		if err == nil {
+			a.sendLog("✔ 内置 sing-box 核心已就绪，已实现单文件闭环。")
+			return targetPath
+		}
+		a.sendLog("警告: 释放内置 sing-box 核心失败: " + err.Error())
 	}
+
+	// 2. 检查当前目录下是否存在 sing-box.exe 或 sing-box
+	for _, name := range []string{"sing-box.exe", "sing-box"} {
+		if _, err := os.Stat(name); err == nil {
+			absPath, err := filepath.Abs(name)
+			if err == nil {
+				a.sendLog("✔ 检测到本地工作目录下的 sing-box 核心: " + absPath)
+				return absPath
+			}
+		}
+	}
+
+	// 3. 检查系统环境变量 PATH 中是否存在 sing-box
+	if path, err := exec.LookPath("sing-box.exe"); err == nil {
+		a.sendLog("✔ 检测到系统 PATH 中的 sing-box 核心: " + path)
+		return path
+	}
+	if path, err := exec.LookPath("sing-box"); err == nil {
+		a.sendLog("✔ 检测到系统 PATH 中的 sing-box 核心: " + path)
+		return path
+	}
+
+	// 4. 检查临时目录下是否已有历史文件
+	tempPath := filepath.Join(os.TempDir(), "warp-scout-singbox.exe")
+	if _, err := os.Stat(tempPath); err == nil {
+		a.sendLog("✔ 使用临时目录已存在的 sing-box 核心: " + tempPath)
+		return tempPath
+	}
+
+	a.sendLog("⚠️ 未找到可用的 sing-box 核心，请确保目录下存在 sing-box.exe 或已配置环境变量")
+	return ""
 }
 
 func (a *App) sendLog(msg string) {
@@ -448,7 +487,7 @@ func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 	return validList, nil
 }
 
-// 核心修改：直接调用被释放的内置 sing-box，丢弃原有的路径查找逻辑
+// 动态调度已就绪的 sing-box 核心路径启动代理进程
 func (a *App) startSingBoxProxy(acc *WarpAccount, ep EndpointResult, proto string, port int) (*exec.Cmd, error) {
 	cleanIP := strings.Trim(ep.IP, "[]")
 	cleanV4 := strings.TrimSuffix(acc.AddressV4, "/32")
@@ -491,15 +530,19 @@ func (a *App) startSingBoxProxy(acc *WarpAccount, ep EndpointResult, proto strin
 		return nil, fmt.Errorf("写入临时代理配置失败: %w", err)
 	}
 
-	if _, err := os.Stat(a.tempSingboxPath); os.IsNotExist(err) {
-		return nil, errors.New("致命错误: 找不到系统内置的 sing-box 核心环境，请尝试以管理员身份运行")
+	// 再次校验核心可执行文件是否存在
+	if a.tempSingboxPath == "" || func() bool { _, err := os.Stat(a.tempSingboxPath); return os.IsNotExist(err) }() {
+		a.tempSingboxPath = a.prepareSingbox()
 	}
 
-	// 强制调用我们在 startup 阶段释放的内置单文件
+	if a.tempSingboxPath == "" {
+		return nil, errors.New("致命错误: 无法找到可用的 sing-box 核心，请确保根目录包含 sing-box.exe 或配置了系统环境变量")
+	}
+
 	cmd := exec.Command(a.tempSingboxPath, "run", "-c", "temp_proxy.json")
 	err = cmd.Start()
 	if err != nil {
-		return nil, fmt.Errorf("后台启动内置代理核心失败: %w", err)
+		return nil, fmt.Errorf("后台启动代理核心失败: %w", err)
 	}
 
 	return cmd, nil
@@ -526,13 +569,13 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		return nil, err
 	}
 
-	a.sendLog("正在全自动唤起内置代理核心 (调用 singboxBin)...")
+	a.sendLog("正在全自动唤起代理核心...")
 	cmd, err := a.startSingBoxProxy(outerAcc, endpoints[0], proto, 20808)
 	if err != nil {
 		a.sendLog(fmt.Sprintf("❌ 自动开启代理失败: %v", err))
 		return nil, err
 	}
-	
+
 	defer func() {
 		if cmd != nil && cmd.Process != nil {
 			cmd.Process.Kill()
@@ -605,7 +648,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"private_key":     innerAcc.PrivateKey,
 		"peer_public_key": innerAcc.PeerPublicKey,
 		"reserved":        []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
-		"mtu":             1200, 
+		"mtu":             1200,
 		"detour":          "WARP-外层优选",
 	}
 
@@ -685,7 +728,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 
 `, nodeName, cleanIP, alpnVal, outerAcc.AccountID))
 
-		default: 
+		default:
 			clashProxies.WriteString(fmt.Sprintf(`  - name: "%s"
     type: wireguard
     server: %s
