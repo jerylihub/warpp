@@ -21,6 +21,28 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Download sing-box Core
+        shell: pwsh
+        run: |
+          $VERSION = "1.10.1"
+          $URL = "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-windows-amd64.zip"
+          
+          Write-Host "Downloading sing-box $VERSION..."
+          Invoke-WebRequest -Uri $URL -OutFile "sing-box.zip"
+          Expand-Archive -Path "sing-box.zip" -DestinationPath "temp_singbox"
+          
+          # 将 sing-box.exe 解压提取并移动到根目录
+          Get-ChildItem -Path "temp_singbox" -Filter "sing-box.exe" -Recurse | Move-Item -Destination ".\" -Force
+          
+          # 清理临时下载文件
+          Remove-Item -Path "sing-box.zip", "temp_singbox" -Recurse -Force
+          
+          # 验证是否存在，确保 //go:embed 能抓取到
+          if (-not (Test-Path ".\sing-box.exe")) {
+              Write-Error "sing-box.exe not found in root directory!"
+              exit 1
+          }
+
       - name: Install Wails CLI
         run: |
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.9.2
